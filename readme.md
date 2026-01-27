@@ -108,7 +108,7 @@ Point to the merged folder instead of using PEFT.
 ## Data & Licensing
 
 - **Data:** Mix of permissively-licensed public instruction data and small curated samples; filtered/deduped.
-- **This repo (code & weight deltas):** **MIT License**
+- **This repo (code & weight deltas):** **NC OSL‑A 1.0 License**
 - **Base model (Phi-2):** retains its own license; comply with upstream terms.
 - **Any datasets:** keep their original licenses/attribution.
 
