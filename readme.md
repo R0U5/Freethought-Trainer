@@ -1,4 +1,4 @@
-# AI Trainer
+# Freethought AI Trainer
 
 A single-file, offline-first LoRA fine-tuning script for causal language models. Built for Windows with a focus on robustness, intelligent early stopping, and automatic dataset handling — designed to produce good training runs with minimal manual tuning.
 
@@ -6,7 +6,7 @@ A single-file, offline-first LoRA fine-tuning script for causal language models.
 
 ## Overview
 
-AI Trainer wraps HuggingFace `transformers` + `peft` into a self-contained script that handles the entire fine-tuning pipeline: dataset ingestion, cleaning, tokenization, LoRA training, and final model merging. It is designed to run **fully offline** against locally cached models and datasets, with no internet connection required after initial setup.
+Freethought AI Trainer wraps HuggingFace `transformers` + `peft` into a self-contained script that handles the entire fine-tuning pipeline: dataset ingestion, cleaning, tokenization, LoRA training, and final model merging. It is designed to run **fully offline** against locally cached models and datasets, with no internet connection required after initial setup.
 
 The script is opinionated by design. Rather than exposing every hyperparameter as an argument, it makes intelligent decisions automatically — sequence length, learning rate schedule, early stopping thresholds, and warmup steps are all derived from your data at runtime.
 
