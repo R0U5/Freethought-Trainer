@@ -158,9 +158,9 @@ Edit the constants near the top of the script before running:
 
 ```python
 BASE_MODEL   = "C:/Your/Path"           # Path to your base model
-OUTPUT_DIR   = ""C:/Your/Path"  # Where checkpoints and merged model are saved
-HF_ROOT      = r"C:\HF_Cache"                 # HuggingFace cache root
-TMP_ROOT     = r"C:\HF_Temp"                  # Temp directory
+OUTPUT_DIR   = "C:/Your/Path"  # Where checkpoints and merged model are saved
+HF_ROOT      = "C:\HF_Cache"                 # HuggingFace cache root
+TMP_ROOT     = "C:\HF_Temp"                  # Temp directory
 
 BATCH_SIZE   = 1      # Per-device batch size
 GRAD_ACCUM   = 12     # Gradient accumulation steps (effective batch = 12)
