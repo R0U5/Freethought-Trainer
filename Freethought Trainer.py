@@ -21,6 +21,15 @@ import warnings
 # that we have no control over. Remove these once PyTorch is updated.
 warnings.filterwarnings("ignore", message="pkg_resources is deprecated", category=UserWarning)
 warnings.filterwarnings("ignore", message="TypedStorage is deprecated", category=UserWarning)
+warnings.filterwarnings("ignore", message="Special tokens have been added", category=UserWarning)
+
+import logging as _logging
+# Silence the HuggingFace datasets "Generating train split" progress line and
+# the transformers "Special tokens have been added" warning — both bypass the
+# standard Python warnings system and must be suppressed via the logging module.
+_logging.getLogger("datasets").setLevel(_logging.ERROR)
+_logging.getLogger("transformers.tokenization_utils_base").setLevel(_logging.ERROR)
+_logging.getLogger("transformers").setLevel(_logging.ERROR)
 
 # Optional emoji stripping — imported once at module level
 try:
@@ -44,6 +53,19 @@ from PIL import Image as PILImage
 import io
 
 
+# ── CLI output helpers ────────────────────────────────────────────────────────
+def _banner(title: str) -> None:
+    width = 60
+    print(f"\n{'─' * width}")
+    print(f"  {title}")
+    print(f"{'─' * width}")
+
+def _ok(msg: str)   -> None: print(f"  ✔  {msg}")
+def _info(msg: str) -> None: print(f"  ·  {msg}")
+def _warn(msg: str) -> None: print(f"  ⚠  {msg}")
+def _err(msg: str)  -> None: print(f"  ✖  {msg}")
+# ──────────────────────────────────────────────────────────────────────────────
+
 HF_ROOT = r"D:\HF_Cache"
 TMP_ROOT = r"D:\HF_Temp"
 os.environ["HF_HOME"] = HF_ROOT
@@ -59,14 +81,13 @@ os.environ["TRANSFORMERS_OFFLINE"] = "1"
 os.environ["HF_DATASETS_OFFLINE"] = "1"
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 os.environ.setdefault("HF_DATASETS_DISABLE_PROGRESS_BARS", "1")
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,garbage_collection_threshold:0.6"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512,garbage_collection_threshold:0.6"  # 128 was tuned for Phi-2; 512 reduces fragmentation for 4B+ models
 
 MAX_LENGTH = 750
-BATCH_SIZE = 1
-GRAD_ACCUM = 12
 SAVE_STEPS = 50
 SAVE_LIMITS = 2
 LOG_STEPS = 1
+BATCH_SIZE = 1  # always 1; effective batch size is controlled by GRAD_ACCUM in each profile
 # Default paths — override via argparse or edit here.
 # Kept as Windows-style defaults; cross-platform paths can be passed at runtime.
 BASE_MODEL = "D:/HF_Models/phi-2"
@@ -77,6 +98,108 @@ TRAINING_CHAIN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "
 MERGE_SUCCESS_FLAG = os.path.join(MERGED_DIR, "success.txt")
 # MODEL_NAME is resolved at runtime inside main() / load_and_prepare_dataset()
 # so that path validation errors surface there, not at import time.
+
+# ── Model profiles ────────────────────────────────────────────────────────────
+# Each entry maps a lowercase substring of the model path to a config dict.
+# Resolution order: entries are checked in definition order; first match wins.
+# Add a new model by inserting a new entry — no other code changes needed.
+#
+# Keys:
+#   attn_implementation  str   PyTorch attention backend for text/causal models
+#   trust_remote_code    bool  Required for models with custom modelling code
+#   use_fast_tokenizer   bool  False only for SentencePiece-based vocabs (Phi-2)
+#   inject_special_tokens bool  True only for models that ship without pad/bos/eos
+#   resize_embeddings    bool  True only when inject_special_tokens adds new ids
+#   lora_r               int   LoRA rank
+#   lora_alpha           int   LoRA scaling factor (typically 2x rank)
+#   lora_targets         list  Attention projection layers to attach adapters to
+#   modules_to_save      list|None  Layers PEFT fully copies & owns (grad safety)
+#   grad_accum           int   Gradient accumulation steps (effective batch size)
+#   learning_rate        float Base learning rate
+#   safe_serialization   bool  False for models with shared weight tensors
+#   enable_input_grads   bool  True for custom-forward models that detach embeddings
+# ─────────────────────────────────────────────────────────────────────────────
+MODEL_PROFILES = {
+    "phi-2": {
+        "attn_implementation":   "sdpa",
+        "trust_remote_code":     False,
+        "use_fast_tokenizer":    False,
+        "inject_special_tokens": True,
+        "resize_embeddings":     True,
+        "lora_r":                16,
+        "lora_alpha":            32,
+        "lora_targets":          ["q_proj", "k_proj", "v_proj", "o_proj"],
+        "modules_to_save":       None,
+        "grad_accum":            16,
+        "learning_rate":         2e-5,
+        "safe_serialization":    True,
+        "enable_input_grads":    False,
+    },
+    # phi-3-vision MUST appear before "phi-3" — first-match-wins.
+    # Phi3VForCausalLM (the vision model class) does not support SDPA in
+    # transformers 4.37.x even in text-only mode, so it must stay on eager.
+    "phi-3-vision": {
+        "attn_implementation":   "eager",
+        "trust_remote_code":     True,
+        "use_fast_tokenizer":    True,
+        "inject_special_tokens": False,
+        "resize_embeddings":     False,
+        "lora_r":                16,
+        "lora_alpha":            32,
+        "lora_targets":          ["q_proj", "k_proj", "v_proj", "o_proj"],
+        "modules_to_save":       ["lm_head"],
+        "grad_accum":            8,
+        "learning_rate":         1e-5,
+        "safe_serialization":    False,
+        "enable_input_grads":    True,
+    },
+    "phi-3": {
+        "attn_implementation":   "sdpa",
+        "trust_remote_code":     True,
+        "use_fast_tokenizer":    True,
+        "inject_special_tokens": False,
+        "resize_embeddings":     False,
+        "lora_r":                16,
+        "lora_alpha":            32,
+        "lora_targets":          ["q_proj", "k_proj", "v_proj", "o_proj"],
+        "modules_to_save":       ["lm_head"],
+        "grad_accum":            8,
+        "learning_rate":         1e-5,
+        "safe_serialization":    False,
+        "enable_input_grads":    True,
+    },
+    # ── Add new models below this line ────────────────────────────────────────
+    # "mistral": { ... },
+    # "llama":   { ... },
+    # "qwen":    { ... },
+    # ─────────────────────────────────────────────────────────────────────────
+}
+
+# Fallback profile for models not listed above.
+# Assumes a modern HF model with fast tokenizer and standard forward pass.
+MODEL_PROFILE_DEFAULT = {
+    "attn_implementation":   "sdpa",
+    "trust_remote_code":     True,
+    "use_fast_tokenizer":    True,
+    "inject_special_tokens": False,
+    "resize_embeddings":     False,
+    "lora_r":                16,
+    "lora_alpha":            32,
+    "lora_targets":          ["q_proj", "k_proj", "v_proj", "o_proj"],
+    "modules_to_save":       ["lm_head"],
+    "grad_accum":            8,
+    "learning_rate":         2e-5,
+    "safe_serialization":    False,
+    "enable_input_grads":    True,
+}
+
+def resolve_model_profile(model_path: str) -> dict:
+    """Return the profile for the given model path, falling back to default."""
+    name = os.path.basename(model_path).lower()
+    for key, profile in MODEL_PROFILES.items():
+        if key in name:
+            return profile
+    return MODEL_PROFILE_DEFAULT
 
 def _resolve_model_name(merged_dir: str, merge_success_flag: str, base_model: str) -> str:
     """Return the correct model path to load from, raising clearly if state is ambiguous."""
@@ -95,7 +218,8 @@ def roc(label: str = "") -> None:
 
     if not torch.cuda.is_available():
         freed_objs = gc.collect()
-        print(f"Roc just {label} collected {freed_objs} objs | CPU only")
+        if freed_objs > 0:
+            _info(f"GC: {freed_objs} objs collected (CPU only)")
         return
 
     torch.cuda.synchronize()
@@ -114,17 +238,18 @@ def roc(label: str = "") -> None:
     freed_driver   = (free_after   - free_before) / MiB
 
     def log_roc(label, freed_objs, freed_alloc, freed_reserved, freed_driver, eps=0.05):
-        parts = [] if freed_objs == 0 else [f"Roc just {label} collected {freed_objs} objs"]
-
+        parts = []
+        if freed_objs > 0:
+            parts.append(f"{freed_objs} objs")
         def add(name, val):
             if not math.isclose(val, 0.0, abs_tol=eps):
-                parts.append(f"{name} {val:.1f}")
-
+                parts.append(f"{name} {val:+.1f} MiB")
         add("alloc", freed_alloc)
         add("reserved", freed_reserved)
         add("driver", freed_driver)
         if parts:
-            print(" | ".join(parts))
+            tag = f" [{label}]" if label else ""
+            _info(f"GC{tag}: " + "  |  ".join(parts))
 
     log_roc(label, freed_objs, freed_alloc, freed_reserved, freed_driver)
 
@@ -400,7 +525,7 @@ def synthesize_prompt_dataset(raw_dataset, col_question, col_chosen, col_rejecte
             processed = processed.remove_columns(cols_to_drop)
         # Filter empty text rows
         processed = processed.filter(lambda e: bool(str(e["text"]).strip()), num_proc=1)
-        print(f"Retained {len(processed):,}/{original_count:,} rows")
+        _info(f"Retained {len(processed):,} / {original_count:,} rows")
 
     else:
         # Text-only path: pandas is fine, no image bytes in memory
@@ -418,7 +543,7 @@ def synthesize_prompt_dataset(raw_dataset, col_question, col_chosen, col_rejecte
         df["text"] = df.apply(build_prompt, axis=1)
         df = df[df["text"].str.strip().astype(bool)].reset_index(drop=True)
         df = df[["text"]]
-        print(f"Retained {len(df):,}/{original_count:,} rows")
+        _info(f"Retained {len(df):,} / {original_count:,} rows")
         processed = Dataset.from_pandas(df)
 
     # Preview first row
@@ -426,12 +551,19 @@ def synthesize_prompt_dataset(raw_dataset, col_question, col_chosen, col_rejecte
         first_raw = raw_dataset[0]
         q = clean(str(first_raw.get(col_question, ""))) if col_question else ""
         a = clean(str(first_raw.get(col_chosen, ""))) if col_chosen else ""
+        _width = 58
+        if q or a:
+            print(f"\n  {'─' * _width}")
+            print(f"  Sample row")
+            print(f"  {'─' * _width}")
         if q:
-            print("\nPrompt:\n-------\n" + q)
+            print(f"  Prompt   : {q[:120]}{'…' if len(q) > 120 else ''}")
         if a:
-            print("\nResponse:\n---------\n" + a, "\n")
+            print(f"  Response : {a[:120]}{'…' if len(a) > 120 else ''}")
+        if q or a:
+            print()
     else:
-        print("[ERROR] No usable prompt found!\n")
+        _err("No usable prompt found!")
 
     return processed
 
@@ -451,11 +583,13 @@ def measure_lengths(ds, tokenizer):
 
     ds = ds.map(_len_map, num_proc=_num_proc)
     lengths = ds["length"]
+    if not lengths:
+        raise ValueError("[ERROR] Dataset is empty after processing — no rows to measure lengths from.")
     p50 = int(np.percentile(lengths, 50))
     p95 = int(np.percentile(lengths, 95))
     p99 = int(np.percentile(lengths, 99))
     auto_len = max(128, min(1024, p95))
-    print(f"Length Statistics - p50:{p50}, p95:{p95}, p99:{p99}/Max Length:{auto_len}")
+    _info(f"Lengths — p50: {p50}  p95: {p95}  p99: {p99}  →  max_length set to {auto_len}")
     return ds, auto_len
 
 
@@ -577,13 +711,13 @@ def log_dataset(dataset_path, log_file_path):
             content = f.read()
             if dataset_name not in content:
                 f.write(dataset_name + "\n")
-                print(f"Logged {dataset_name} to {os.path.basename(log_file_path)}")
+                _ok(f"Logged '{dataset_name}' to training chain")
                 return True
             else:
-                print(f"{dataset_name} already logged")
+                _info(f"'{dataset_name}' already in training chain")
                 return False
     except Exception as e:
-        print(f"[ERROR] Could not log dataset: {e}")
+        _warn(f"Could not log dataset: {e}")
         return False
         
 def purge_checkpoints():
@@ -606,9 +740,9 @@ def purge_checkpoints():
         if os.path.isdir(last_good):
             shutil.rmtree(last_good, ignore_errors=True)
 
-        print(f"Purged {removed} checkpoints")
+        _info(f"Purged {removed} old checkpoints")
     except Exception as e:
-        print(f"[ERROR] Failed to purge checkpoints: {e}")
+        _warn(f"Failed to purge checkpoints: {e}")
 
 def load_and_prepare_dataset(dataset_path, cleaning_mode, image_mode=False, base_model_override=None):
     _num_proc = min(12, os.cpu_count() or 4)
@@ -616,7 +750,7 @@ def load_and_prepare_dataset(dataset_path, cleaning_mode, image_mode=False, base
     # --- Support HF Hub dataset IDs (e.g. "username/dataset-name") as well as local parquet
     is_hf_hub = not os.path.exists(dataset_path) and "/" in dataset_path
     if is_hf_hub:
-        print(f"Loading HF Hub dataset: {dataset_path}")
+        _info(f"Source: HF Hub — {dataset_path}")
         # Disable offline mode temporarily for HF Hub load
         _prev_offline = os.environ.pop("HF_DATASETS_OFFLINE", None)
         _prev_tr_offline = os.environ.pop("TRANSFORMERS_OFFLINE", None)
@@ -641,29 +775,31 @@ def load_and_prepare_dataset(dataset_path, cleaning_mode, image_mode=False, base
         training_mode = detect_training_mode(columns)
 
     col_question, col_chosen, col_rejected, col_image = auto_map_roles(columns, training_mode)
-    print(f"Image    → {'Not used' if not col_image    else col_image}")
-    print(f"Question → {'Not used' if not col_question else col_question}")
-    print(f"Chosen   → {'Not used' if not col_chosen   else col_chosen}")
-    print(f"Rejected → {'Not used' if not col_rejected else col_rejected}")
+    _banner("Dataset")
+    _info(f"Mode: {training_mode.upper()}  |  Cleaning: {cleaning_mode or 'math'}  |  Seed: {shuffle_seed}")
+    _info(f"Image    → {'—' if not col_image    else col_image}")
+    _info(f"Question → {'—' if not col_question else col_question}")
+    _info(f"Answer   → {'—' if not col_chosen   else col_chosen}")
+    _info(f"Rejected → {'—' if not col_rejected else col_rejected}")
     effective_mode = cleaning_mode or "math"
     clean = lambda s: clean_string(s, mode=effective_mode)
-    print(f"Mode: {effective_mode}\nSeed: {shuffle_seed}")
 
     # Resolve model path — CLI override > hardcoded constant
     _default_base = base_model_override or (BASE_MODEL_IMAGE if image_mode else BASE_MODEL)
     model_name = _resolve_model_name(MERGED_DIR, MERGE_SUCCESS_FLAG, _default_base)
     if os.path.exists(MERGE_SUCCESS_FLAG):
-        print(f"Loading previous merged model: {MERGED_DIR}")
+        _ok(f"Resuming from previous merged model: {MERGED_DIR}")
     else:
-        base_label = "image base (Phi-3-Vision)" if image_mode else "text base (Phi-2)"
+        base_label = "image base (Phi-3-Vision)" if image_mode else f"text base ({os.path.basename(_default_base)})"
         if base_model_override:
             base_label = f"override: {base_model_override}"
-        print(f"No successful merge found — using {base_label}: {model_name}")
+        _info(f"Base model: {model_name}")
 
     # --- Processor (image mode) vs Tokenizer (text mode)
+    profile = resolve_model_profile(model_name)
     processor = None
     if image_mode:
-        print("Loading AutoProcessor for Phi-3-Vision...")
+        _info("Loading AutoProcessor (Phi-3-Vision)...")
         processor = AutoProcessor.from_pretrained(
             model_name,
             trust_remote_code=True,
@@ -671,12 +807,14 @@ def load_and_prepare_dataset(dataset_path, cleaning_mode, image_mode=False, base
         )
         tokenizer = processor.tokenizer
     else:
-        tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False, local_files_only=True)
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_name,
+            use_fast=profile["use_fast_tokenizer"],
+            trust_remote_code=profile["trust_remote_code"],
+            local_files_only=True
+        )
 
-    # Phi-3-Vision already has <|end|>, <|user|>, <|assistant|>, <|endoftext|> etc
-    # baked into its vocabulary.  Injecting new tokens would corrupt those IDs and
-    # cause an embedding size mismatch on the model.  Skip for image mode entirely.
-    if not image_mode:
+    if not image_mode and profile["inject_special_tokens"]:
         special_tokens = {
             "pad_token": "<|pad|>",
             "bos_token": "<|startoftext|>",
@@ -686,7 +824,7 @@ def load_and_prepare_dataset(dataset_path, cleaning_mode, image_mode=False, base
     tokenizer.pad_token = tokenizer.pad_token or tokenizer.eos_token or tokenizer.unk_token
 
     if training_mode == "causal":
-        print("\nCausal mode detected. Synthesis will be applied.\n")
+        _info("Causal mode — GPT-style synthesis will be applied")
         def synth_gpt_prompt(example):
             instruction = example.get("instruction", "").strip()
             input_ = example.get("input", "").strip()
@@ -704,10 +842,11 @@ def load_and_prepare_dataset(dataset_path, cleaning_mode, image_mode=False, base
         )
 
     # Measure lengths and derive a robust max_length
-    print("Measuring lengths...")
+    _banner("Tokenization")
+    _info("Measuring sequence lengths...")
     processed, auto_len = measure_lengths(processed, tokenizer)
 
-    print("Tokenizing...: ", end="")
+    _info("Tokenizing dataset...")
 
     # Columns to drop after tokenization.
     # "length" is kept as it was computed pre-tokenize and is reused.
@@ -745,9 +884,9 @@ def load_and_prepare_dataset(dataset_path, cleaning_mode, image_mode=False, base
         )
         dropped = before - len(tokenized)
         if dropped:
-            print(f"[WARN] Dropped {dropped} rows with unreadable images")
+            _warn(f"Dropped {dropped} rows with unreadable images")
 
-    print("Casting dataset: ", end="")
+    _info("Casting columns to tensor format...")
     tokenized = tokenized.cast_column("input_ids", Sequence(Value("int64")))
     tokenized = tokenized.cast_column("attention_mask", Sequence(Value("int64")))
     tokenized = tokenized.cast_column("labels", Sequence(Value("int64")))
@@ -783,22 +922,38 @@ def select_scheduler(dataset_rows: int, epochs: int, min_stop_steps: int) -> str
     return "cosine"
 
 def load_model(tokenizer, model_name, image_mode=False, base_model_override=None):
+    profile = resolve_model_profile(model_name)
+
     if image_mode:
-        print("Loading Phi-3-Vision (AutoModelForVision2Seq)...")
+        _banner("Model")
+        _info("Loading Phi-3-Vision (AutoModelForVision2Seq)...")
         base_model = AutoModelForVision2Seq.from_pretrained(
             model_name,
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
             local_files_only=True,
-            _attn_implementation="eager",  # flash_attention_2 optional if installed
+            # Vision models stay on eager — Phi-3-Vision's vision encoder is
+            # incompatible with SDPA's dispatcher. flash_attention_2 is also
+            # unavailable on Windows 11.
+            _attn_implementation="eager",
         ).to("cuda")
     else:
+        _banner("Model")
+        _info(f"Loading {os.path.basename(model_name)} (AutoModelForCausalLM)...")
         base_model = AutoModelForCausalLM.from_pretrained(
             model_name,
             torch_dtype=torch.bfloat16,
-            trust_remote_code=False,
+            trust_remote_code=profile["trust_remote_code"],
             local_files_only=True,
+            _attn_implementation=profile["attn_implementation"],
         ).to("cuda")
+
+    # Disable KV cache on the BASE model before any PEFT wrapping.
+    # Must happen here — setting it on the PeftModel wrapper afterwards does not
+    # reliably propagate for all architectures, leaving output tensors detached
+    # from the autograd graph and causing "does not require grad" crashes.
+    if hasattr(base_model.config, "use_cache"):
+        base_model.config.use_cache = False
 
     last_ckpt = os.path.join(OUTPUT_DIR, "checkpoint-last")
 
@@ -814,23 +969,27 @@ def load_model(tokenizer, model_name, image_mode=False, base_model_override=None
 
         base_has_config = os.path.isfile(os.path.join(model_name, "config.json"))
         if (not base_has_config) or (recorded_base and os.path.abspath(recorded_base) != os.path.abspath(model_name)):
-            print("Ignoring checkpoint-last (base mismatch or missing config) → fresh LoRA")
+            _warn("Checkpoint base mismatch — starting fresh LoRA")
             use_last = False
 
     if use_last:
-        print("Resuming adapter from checkpoint-last...")
+        _ok("Resuming LoRA adapter from checkpoint-last")
+        if profile["resize_embeddings"] and tokenizer.added_tokens_encoder:
+            base_model.resize_token_embeddings(len(tokenizer))
         model = PeftModel.from_pretrained(base_model, last_ckpt, is_trainable=True)
     else:
-        print("Using fresh LoRA adapter")
+        _info("Initialising fresh LoRA adapter")
         if image_mode:
-            # r=8 for 12 GB VRAM headroom; target both LLM attention and vision projection
-            lora_r = 8
-            lora_alpha = 16
+            # VLM: smaller rank for VRAM headroom; no modules_to_save needed
+            lora_r      = 8
+            lora_alpha  = 16
             lora_targets = ["q_proj", "k_proj", "v_proj", "o_proj"]
+            lora_modules_to_save = None
         else:
-            lora_r = 16
-            lora_alpha = 32
-            lora_targets = ["q_proj", "k_proj", "v_proj"]
+            lora_r      = profile["lora_r"]
+            lora_alpha  = profile["lora_alpha"]
+            lora_targets = profile["lora_targets"]
+            lora_modules_to_save = profile["modules_to_save"]
 
         peft_config = LoraConfig(
             r=lora_r,
@@ -840,21 +999,41 @@ def load_model(tokenizer, model_name, image_mode=False, base_model_override=None
             bias="none",
             task_type="CAUSAL_LM",
             base_model_name_or_path=os.path.abspath(model_name),
+            modules_to_save=lora_modules_to_save,
         )
+
+        # Resize BEFORE wrapping with LoRA so new embedding rows are covered by
+        # the adapter and the gradient graph stays intact. Only done for models
+        # that inject special tokens (currently Phi-2 only).
+        if profile["resize_embeddings"] and tokenizer.added_tokens_encoder:
+            _info(f"Resizing embeddings: +{len(tokenizer.added_tokens_encoder)} new tokens")
+            base_model.resize_token_embeddings(len(tokenizer))
+
         model = get_peft_model(base_model, peft_config)
+
+        # modules_to_save wraps lm_head so PEFT owns it and gradient flow is
+        # guaranteed through it — but we don't want to actually *train* 98M lm_head
+        # weights on top of the LoRA params. Freeze them immediately after wrapping.
+        # The gradient path stays intact; only LoRA adapter weights update.
+        if lora_modules_to_save:
+            for name, param in model.named_parameters():
+                if any(
+                    f"modules_to_save.default.{m}" in name
+                    for m in lora_modules_to_save
+                ):
+                    param.requires_grad_(False)
+
+    # Some architectures (e.g. Phi-3 with trust_remote_code) can detach input
+    # embeddings from the autograd graph. This call forces gradient flow through
+    # inputs regardless of the custom forward implementation.
+    if profile["enable_input_grads"]:
+        model.enable_input_require_grads()
 
     print_trainable_parameters(model)
 
-    if tokenizer.added_tokens_encoder:
-        print(f"Resizing embeddings for {len(tokenizer.added_tokens_encoder)} new tokens...")
-        model.resize_token_embeddings(len(tokenizer))
-
-    if hasattr(model.config, "use_cache"):
-        model.config.use_cache = False
-
-    # Enable gradient checkpointing for image mode to save ~3-4 GB VRAM on 12 GB card
+    # Gradient checkpointing for image mode — saves ~3-4 GB VRAM on 12 GB card
     if image_mode:
-        print("Enabling gradient checkpointing (VRAM optimisation for VLM)...")
+        _info("Gradient checkpointing enabled (VRAM optimisation)")
         model.gradient_checkpointing_enable()
 
     return model
@@ -862,7 +1041,7 @@ def load_model(tokenizer, model_name, image_mode=False, base_model_override=None
 def print_trainable_parameters(model):
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Trainable params: {trainable} / {total} ({100 * trainable / total:.2f}%)")
+    _ok(f"Trainable params: {trainable:,} / {total:,}  ({100 * trainable / total:.2f}%)")
         
 class EarlyStopByLoss(TrainerCallback):
 
@@ -1101,7 +1280,7 @@ if ($ofd.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
             if path:
                 return path
     except Exception as e:
-        print(f"PowerShell picker failed ({e})!")
+        _warn(f"PowerShell file picker failed — falling back to text input")
     return input("Dataset path (.parquet): ").strip()
 
 
@@ -1120,9 +1299,10 @@ def main():
     image_mode   = parsed_args.image
 
     # Resolve base model: CLI arg > hardcoded constant
+    _banner("Freethought Trainer")
     if parsed_args.base_model:
         resolved_base = parsed_args.base_model
-        print(f"Base model override: {resolved_base}")
+        _info(f"Base model override: {resolved_base}")
     else:
         resolved_base = BASE_MODEL_IMAGE if image_mode else BASE_MODEL
 
@@ -1137,17 +1317,17 @@ def main():
     # --- Dataset selection: HF Hub flag > file picker
     if parsed_args.hf_dataset:
         dataset_path = parsed_args.hf_dataset
-        print(f"Using HF Hub dataset: {dataset_path}")
+        _info(f"HF Hub dataset: {dataset_path}")
     else:
         dataset_path = select_file()
         if image_mode and dataset_path and not dataset_path.lower().endswith(".parquet"):
             # Allow non-parquet for HF Hub paths entered via input()
             if not ("/" in dataset_path and not os.path.exists(dataset_path)):
-                print("[ERROR] Please select a valid .parquet file or pass --hf_dataset!")
+                _err("Please select a valid .parquet file or pass --hf_dataset")
                 return
         elif not image_mode:
             if (not dataset_path) or (not dataset_path.lower().endswith(".parquet")):
-                print("[ERROR] Please select a valid .parquet file!")
+                _err("Please select a valid .parquet file")
                 return
 
     if cleaning_mode in {"latex", "math"} and not image_mode:
@@ -1155,30 +1335,31 @@ def main():
             df_columns = pd.read_parquet(dataset_path, engine="pyarrow", columns=None).columns
             training_mode_peek = detect_training_mode(df_columns)
         except Exception as e:
-            print(f"Can't auto-adjust cleaning mode: {e}")
+            _warn(f"Could not auto-detect cleaning mode: {e}")
 
     if image_mode:
-        print("\n--- IMAGE MODE ENABLED (Phi-3-Vision / multimodal) ---")
-        print(f"Base model: {BASE_MODEL_IMAGE}\n")
+        _info("Image mode enabled (Phi-3-Vision / multimodal)")
 
     train_dataset, eval_dataset, tokenizer, training_mode, model_name, processor = load_and_prepare_dataset(
         dataset_path, cleaning_mode, image_mode=image_mode, base_model_override=resolved_base
     )
 
-    estimated_steps = len(train_dataset) // (BATCH_SIZE * GRAD_ACCUM)
+    profile = resolve_model_profile(model_name)
+    _info(f"Model profile: {os.path.basename(model_name)}  |  grad_accum: {profile['grad_accum']}  |  lr: {profile['learning_rate']}")
+    estimated_steps = len(train_dataset) // (BATCH_SIZE * profile["grad_accum"])
     use_steps = parsed_args.steps is not None
 
     if use_steps:
         total_steps = parsed_args.steps
         num_train_epochs = max(1, total_steps // max(estimated_steps, 1))
-        print(f"Using fixed steps: {total_steps}")
+        _info(f"Fixed steps: {total_steps}")
     else:
         num_train_epochs = parsed_args.epoch
         total_steps = estimated_steps * num_train_epochs
-        print(f"Estimated steps: {total_steps}")
+        _info(f"Estimated steps: {total_steps}")
 
     use_early_stop = not force_epoch and not use_steps
-    min_stop_steps = compute_min_steps(train_dataset, BATCH_SIZE, GRAD_ACCUM)
+    min_stop_steps = compute_min_steps(train_dataset, BATCH_SIZE, profile["grad_accum"])
     early_stop = None
 
     if use_early_stop:
@@ -1201,22 +1382,21 @@ def main():
             patience=8,
             cooldown_after_best=3
         )
-        print(
-            f"Early Stop enabled | exposure floor ≥ {int(100 * early_stop.exposure_floor)}% "
-            f"| hard cap {int(cap * 100)}% ({hard_cap_steps} steps)"
-        )
+        _info(f"Early stop: floor ≥ {int(100 * early_stop.exposure_floor)}%  |  hard cap {int(cap * 100)}% ({hard_cap_steps} steps)")
     else:
-        print("Early Stop disabled")
+        _info("Early stop: disabled")
 
     selected_scheduler = select_scheduler(train_dataset.num_rows, num_train_epochs, min_stop_steps)
-    print(f"Dynamic LR scheduler: {selected_scheduler.upper()}")
+    _banner("Training Config")
+    _info(f"Rows: {len(train_dataset):,}  |  Steps: {total_steps}  |  Epochs: {num_train_epochs}")
+    _info(f"Scheduler: {selected_scheduler.upper()}  |  LR: {profile['learning_rate']}  |  Batch: {BATCH_SIZE}  |  Grad accum: {profile['grad_accum']}")
     dynamic_warmup = max(75, int(0.01 * total_steps))
 
     args = TrainingArguments(
         output_dir=OUTPUT_DIR,
         per_device_train_batch_size=BATCH_SIZE,
-        gradient_accumulation_steps=GRAD_ACCUM,
-        learning_rate=2e-5,
+        gradient_accumulation_steps=profile["grad_accum"],
+        learning_rate=profile["learning_rate"],
         log_level="error",
         warmup_steps=dynamic_warmup,
         remove_unused_columns=False,
@@ -1257,33 +1437,47 @@ def main():
         callbacks=[] if early_stop is None else [early_stop],
     )
 
+    _training_error = None
     try:
         if eval_dataset is not None:
-            print(f"Eval rows: {len(eval_dataset)}")
-        print(f"Train rows: {len(train_dataset)}")
-        print(f"Estimated steps: {total_steps}")
+            _info(f"Eval rows: {len(eval_dataset):,}")
 
         if total_steps < 1:
-            print("[ERROR] Not enough data to train!")
+            _err("Not enough data to train!")
             exit()
 
-        print(f"Using dynamic warmup: {dynamic_warmup}\n")
+        _banner("Training")
+        _info(f"Train rows: {len(train_dataset):,}  |  Steps: {total_steps}  |  Warmup: {dynamic_warmup}")
         last_ckpt = os.path.join(OUTPUT_DIR, "checkpoint-last")
 
         if os.path.isdir(last_ckpt):
-            print(f"Resuming from checkpoint: {last_ckpt}")
+            _ok(f"Resuming from checkpoint: {last_ckpt}")
             trainer.train(resume_from_checkpoint=last_ckpt)
         else:
             trainer.train()
         roc()
     except KeyboardInterrupt:
-        print("\n\n***Keyboard interrupt! Saving...***\n\n")
+        _warn("Keyboard interrupt — saving current state...")
         if isinstance(model, PeftModel):
             model.save_pretrained(MERGED_DIR)
         else:
             trainer.save_model(MERGED_DIR)
+    except Exception as e:
+        # Unexpected training error — record it and fall through to merge+save
+        # so the model isn't lost, then re-raise at the very end.
+        _training_error = e
+        _err(f"Training error: {e}")
+        _warn("Attempting emergency save before merge...")
+        try:
+            if isinstance(model, PeftModel):
+                model.save_pretrained(MERGED_DIR)
+            else:
+                trainer.save_model(MERGED_DIR)
+        except Exception as save_err:
+            _err(f"Emergency save also failed: {save_err}")
     finally:
-        print("\nCleaning checkpoints...")
+        _banner("Cleanup")
+        _info("Cleaning checkpoints...")
         ckpts = [d for d in os.listdir(OUTPUT_DIR) if d.startswith("checkpoint-")]
         ckpts = sorted(
             [d for d in ckpts if d.split("-")[-1].isdigit()],
@@ -1303,64 +1497,84 @@ def main():
             try:
                 os.symlink(last_path, symlink_path, target_is_directory=True)
             except (OSError, NotImplementedError):
-                print("Couldn't create symlink")
+                _warn("Could not create symlink — copying instead")
                 shutil.copytree(last_path, symlink_path)
-                print(f"checkpoint-last copied → {latest}")
+                _ok(f"checkpoint-last → {latest}")
 
             backup_path = os.path.join(OUTPUT_DIR, "last_good_ckpt")
             shutil.copytree(last_path, backup_path, dirs_exist_ok=True)
-            print("Backed up last checkpoint")
+            _ok("Last checkpoint backed up")
 
     if isinstance(model, PeftModel):
-        print("Merging LoRA...")
+        _banner("Saving")
+        _info("Merging LoRA weights into base model...")
         try:
             merged_model = model.merge_and_unload()
             final_model_to_save = merged_model
+            _ok("LoRA merge complete")
         except Exception as e:
-            print(f"Merge failed: {e}")
+            _warn(f"Merge failed: {e} — saving adapter as-is")
             final_model_to_save = model
     else:
-        print("Model already merged!")
+        _banner("Saving")
+        _info("Model already merged")
         final_model_to_save = model
 
-    print(f"Model saving to: {MERGED_DIR}")
+    _info(f"Saving to: {MERGED_DIR}")
     os.makedirs(MERGED_DIR, exist_ok=True)
+    save_profile = resolve_model_profile(resolved_base)
     try:
-        final_model_to_save.save_pretrained(MERGED_DIR)
+        final_model_to_save.save_pretrained(
+            MERGED_DIR,
+            safe_serialization=save_profile["safe_serialization"],
+        )
     except Exception as e:
-        print(f"[ERROR] save_pretrained failed: {e}")
-        print("Retrying with rebuilt base (resized to tokenizer)...")
+        _err(f"save_pretrained failed: {e}")
+        _warn("Retrying with rebuilt base model...")
         if image_mode:
             base = AutoModelForVision2Seq.from_pretrained(
                 resolved_base,
                 local_files_only=True,
                 trust_remote_code=True,
-                torch_dtype=torch.bfloat16
+                torch_dtype=torch.bfloat16,
+                _attn_implementation="eager",
             ).to("cuda")
         else:
             base = AutoModelForCausalLM.from_pretrained(
                 resolved_base,
                 local_files_only=True,
-                torch_dtype=torch.bfloat16
+                trust_remote_code=save_profile["trust_remote_code"],
+                torch_dtype=torch.bfloat16,
+                _attn_implementation="eager",
             ).to("cuda")
-        try:
-            base.resize_token_embeddings(len(tokenizer))
-        except Exception:
-            pass
+        if save_profile["resize_embeddings"]:
+            try:
+                base.resize_token_embeddings(len(tokenizer))
+            except Exception:
+                pass
         sd = {k: v.cpu() for k, v in final_model_to_save.state_dict().items()}
         missing_unexp = base.load_state_dict(sd, strict=False)
-        print(f"State-dict loaded with (missing, unexpected): {missing_unexp}")
-        base.save_pretrained(MERGED_DIR)
+        _info(f"State-dict loaded — missing/unexpected: {missing_unexp}")
+        base.save_pretrained(MERGED_DIR, safe_serialization=save_profile["safe_serialization"])
 
     # Save processor (image mode) or tokenizer (text mode)
     if image_mode and processor is not None:
         processor.save_pretrained(MERGED_DIR)
-        print("Processor saved.")
+        _ok("Processor saved")
     else:
         tokenizer.save_pretrained(MERGED_DIR)
 
-    with open(os.path.join(MERGED_DIR, "success.txt"), "w", encoding="utf-8") as f:
-        f.write("Merge complete")
+    # Only write success.txt if training completed without error.
+    # If there was a training error, the merged model is from a partial/crashed
+    # run — do not mark it as successful or the next run will load it as a base.
+    if _training_error is None:
+        with open(os.path.join(MERGED_DIR, "success.txt"), "w", encoding="utf-8") as f:
+            f.write("Merge complete")
+        _banner("Done")
+        _ok(f"Model saved to {MERGED_DIR}")
+        print()
+    else:
+        raise _training_error
 
 
 if __name__ == '__main__':
