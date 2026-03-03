@@ -250,4 +250,4 @@ Multimodal path avoids converting the dataset to pandas to prevent pulling all i
 ---
 
 ## License / notes
-This repository contains a single-file training script. Use at your own risk; validate outputs and ensure you have the rights to train on your datasets.
+Non Commercial Open Software License — Attribution & Copyleft (NC OSL‑A 1.0)
