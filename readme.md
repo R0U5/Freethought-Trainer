@@ -56,8 +56,8 @@ Optional:
 
 1) Put your base model(s) on disk (HF format folders, not GGUF):
 - Example defaults inside the script:
-  - `D:/HF_Models/phi-2`
-  - `D:/HF_Models/phi-3-vision`
+  - `C:/HF_Models/phi-2`
+  - `C:/HF_Models/phi-3-vision`
 
 2) Edit the constants near the top of `Freethought Trainer.py` if you want:
 - `HF_ROOT`, `TMP_ROOT`
